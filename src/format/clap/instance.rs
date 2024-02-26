@@ -1,27 +1,38 @@
-use std::cell::UnsafeCell;
 use std::collections::HashMap;
-use std::ffi::{c_char, c_void, CStr};
 use std::iter::zip;
+use std::marker::PhantomData;
 use std::ptr::NonNull;
+use std::slice;
 use std::sync::Arc;
-use std::{io, ptr, slice};
 
-use clap_sys::ext::{audio_ports::*, audio_ports_config::*, gui::*, params::*, state::*};
-use clap_sys::{events::*, id::*, plugin::*, process::*, stream::*};
+use clack_extensions::params::implementation::{
+    ParamDisplayWriter, ParamInfoWriter, PluginAudioProcessorParams, PluginMainThreadParams,
+};
+use clack_extensions::params::info::{ParamInfoData, ParamInfoFlags};
+use clack_extensions::{
+    audio_ports::*, audio_ports_config::*, gui::PluginGui, params::*, state::*,
+};
+use clack_plugin::events::spaces::CoreEventSpace;
+use clack_plugin::events::Event as ClackEvent;
+use clack_plugin::prelude::Plugin as ClackPlugin;
+use clack_plugin::prelude::*;
+use clack_plugin::stream::{InputStream, OutputStream};
+use clack_plugin::utils::Cookie;
 
 use crate::buffers::{BufferData, BufferType, BufferView, Buffers, RawBuffers};
 use crate::bus::{BusDir, Format};
 use crate::events::{Data, Event, Events};
+use crate::format::clap::ClapPlugin;
 use crate::params::{ParamId, ParamInfo, ParamValue};
 use crate::plugin::{Host, Plugin, PluginInfo};
 use crate::process::{Config, Processor};
 use crate::sync::params::ParamValues;
-use crate::util::{copy_cstring, slice_from_raw_parts_checked, DisplayParam};
+use crate::util::DisplayParam;
 
-fn port_type_from_format(format: &Format) -> &'static CStr {
+fn port_type_from_format(format: &Format) -> AudioPortType<'static> {
     match format {
-        Format::Mono => CLAP_PORT_MONO,
-        Format::Stereo => CLAP_PORT_STEREO,
+        Format::Mono => AudioPortType::MONO,
+        Format::Stereo => AudioPortType::STEREO,
     }
 }
 
@@ -41,37 +52,58 @@ fn map_param_out(param: &ParamInfo, value: ParamValue) -> f64 {
     }
 }
 
-pub struct MainThreadState<P: Plugin> {
+pub struct MainThreadState<'a, P: Plugin> {
     pub layout_index: usize,
     pub plugin: P,
     pub editor: Option<P::Editor>,
+    pub instance: &'a InstanceShared<P>,
 }
 
-pub struct ProcessState<P: Plugin> {
+pub struct ProcessState<'a, P: Plugin> {
     buffer_data: Vec<BufferData>,
     buffer_ptrs: Vec<*mut f32>,
     events: Vec<Event>,
-    processor: Option<P::Processor>,
+    processor: P::Processor,
+    instance: &'a InstanceShared<P>,
 }
 
-#[repr(C)]
-pub struct Instance<P: Plugin> {
-    #[allow(unused)]
-    pub clap_plugin: clap_plugin,
+// Due to buffer_ptrs
+unsafe impl<'a, P: Plugin> Send for ProcessState<'a, P> {}
+
+pub struct Instance<P: Plugin>(PhantomData<fn() -> P>);
+
+impl<P: Plugin + ClapPlugin> ClackPlugin for Instance<P> {
+    type AudioProcessor<'a> = ProcessState<'a, P>;
+    type Shared<'a> = InstanceShared<P>;
+    type MainThread<'a> = MainThreadState<'a, P>;
+
+    fn declare_extensions(builder: &mut PluginExtensions<Self>, shared: &Self::Shared<'_>) {
+        builder
+            .register::<PluginAudioPorts>()
+            .register::<PluginAudioPortsConfig>()
+            .register::<PluginParams>()
+            .register::<PluginState>();
+
+        if shared.info.has_editor {
+            builder.register::<PluginGui>();
+        }
+    }
+}
+
+pub struct InstanceShared<P: Plugin> {
     pub info: Arc<PluginInfo>,
     pub input_bus_map: Vec<usize>,
     pub output_bus_map: Vec<usize>,
     pub param_map: HashMap<ParamId, usize>,
     pub plugin_params: ParamValues,
     pub processor_params: ParamValues,
-    pub main_thread_state: UnsafeCell<MainThreadState<P>>,
-    pub process_state: UnsafeCell<ProcessState<P>>,
+    _plugin: PhantomData<fn() -> P>,
 }
 
-unsafe impl<P: Plugin> Sync for Instance<P> {}
+impl<'a, P: Plugin> PluginShared<'a> for InstanceShared<P> {}
 
-impl<P: Plugin> Instance<P> {
-    pub fn new(desc: *const clap_plugin_descriptor, info: &Arc<PluginInfo>) -> Self {
+impl<'a, P: Plugin> InstanceShared<P> {
+    pub fn new(_host: HostHandle<'a>, info: &Arc<PluginInfo>) -> Result<Self, PluginError> {
         let mut input_bus_map = Vec::new();
         let mut output_bus_map = Vec::new();
         for (index, bus) in info.buses.iter().enumerate() {
@@ -90,39 +122,15 @@ impl<P: Plugin> Instance<P> {
             param_map.insert(param.id, index);
         }
 
-        Instance {
-            clap_plugin: clap_plugin {
-                desc,
-                plugin_data: ptr::null_mut(),
-                init: Some(Self::init),
-                destroy: Some(Self::destroy),
-                activate: Some(Self::activate),
-                deactivate: Some(Self::deactivate),
-                start_processing: Some(Self::start_processing),
-                stop_processing: Some(Self::stop_processing),
-                reset: Some(Self::reset),
-                process: Some(Self::process),
-                get_extension: Some(Self::get_extension),
-                on_main_thread: Some(Self::on_main_thread),
-            },
+        Ok(Self {
+            plugin_params: ParamValues::new(&info.params),
+            processor_params: ParamValues::new(&info.params),
             info: info.clone(),
             input_bus_map,
             output_bus_map,
             param_map,
-            plugin_params: ParamValues::new(&info.params),
-            processor_params: ParamValues::new(&info.params),
-            main_thread_state: UnsafeCell::new(MainThreadState {
-                layout_index: 0,
-                plugin: P::new(Host {}),
-                editor: None,
-            }),
-            process_state: UnsafeCell::new(ProcessState {
-                buffer_data: Vec::new(),
-                buffer_ptrs: Vec::new(),
-                events: Vec::with_capacity(4096),
-                processor: None,
-            }),
-        }
+            _plugin: PhantomData,
+        })
     }
 
     fn sync_plugin(&self, plugin: &mut P) {
@@ -140,28 +148,33 @@ impl<P: Plugin> Instance<P> {
     }
 }
 
-impl<P: Plugin> Instance<P> {
-    unsafe extern "C" fn init(_plugin: *const clap_plugin) -> bool {
-        true
+impl<'a, P: Plugin> PluginMainThread<'a, InstanceShared<P>> for MainThreadState<'a, P> {}
+impl<'a, P: Plugin> MainThreadState<'a, P> {
+    pub fn new(
+        _host: HostMainThreadHandle<'a>,
+        instance: &'a InstanceShared<P>,
+    ) -> Result<Self, PluginError> {
+        Ok(Self {
+            layout_index: 0,
+            plugin: P::new(Host {}),
+            editor: None,
+            instance,
+        })
     }
+}
 
-    unsafe extern "C" fn destroy(plugin: *const clap_plugin) {
-        drop(Box::from_raw(plugin as *mut Self));
-    }
-
-    unsafe extern "C" fn activate(
-        plugin: *const clap_plugin,
-        sample_rate: f64,
-        _min_frames_count: u32,
-        max_frames_count: u32,
-    ) -> bool {
-        let instance = &*(plugin as *const Self);
-        let main_thread_state = &mut *instance.main_thread_state.get();
-        let process_state = &mut *instance.process_state.get();
-
+impl<'a, P: Plugin> PluginAudioProcessor<'a, InstanceShared<P>, MainThreadState<'a, P>>
+    for ProcessState<'a, P>
+{
+    fn activate(
+        _host: HostAudioThreadHandle<'a>,
+        main_thread_state: &mut MainThreadState<P>,
+        instance: &'a InstanceShared<P>,
+        audio_config: AudioConfiguration,
+    ) -> Result<Self, PluginError> {
         let layout = &instance.info.layouts[main_thread_state.layout_index];
 
-        process_state.buffer_data.clear();
+        let mut buffer_data = Vec::new();
         let mut total_channels = 0;
         for (info, format) in zip(&instance.info.buses, &layout.formats) {
             let buffer_type = match info.dir {
@@ -170,7 +183,7 @@ impl<P: Plugin> Instance<P> {
             };
             let channel_count = format.channel_count();
 
-            process_state.buffer_data.push(BufferData {
+            buffer_data.push(BufferData {
                 buffer_type,
                 start: total_channels,
                 end: total_channels + channel_count,
@@ -179,587 +192,358 @@ impl<P: Plugin> Instance<P> {
             total_channels += channel_count;
         }
 
-        process_state.buffer_ptrs.resize(total_channels, NonNull::dangling().as_ptr());
-
         let config = Config {
             layout: layout.clone(),
-            sample_rate,
-            max_buffer_size: max_frames_count as usize,
+            sample_rate: audio_config.sample_rate,
+            max_buffer_size: audio_config.max_sample_count as usize,
         };
 
         instance.sync_plugin(&mut main_thread_state.plugin);
-        process_state.processor = Some(main_thread_state.plugin.processor(config));
 
-        true
+        Ok(ProcessState {
+            buffer_data,
+            buffer_ptrs: vec![NonNull::dangling().as_ptr(); total_channels],
+            events: Vec::with_capacity(4096),
+            processor: main_thread_state.plugin.processor(config),
+            instance,
+        })
     }
 
-    unsafe extern "C" fn deactivate(plugin: *const clap_plugin) {
-        let instance = &*(plugin as *const Self);
-        let process_state = &mut *instance.process_state.get();
-
-        process_state.processor = None;
+    fn reset(&mut self) {
+        self.instance.sync_processor(&mut self.processor);
+        self.processor.reset();
     }
 
-    unsafe extern "C" fn start_processing(_plugin: *const clap_plugin) -> bool {
-        true
-    }
+    fn process(
+        &mut self,
+        _process: Process,
+        mut audio: Audio,
+        events: clack_plugin::prelude::Events,
+    ) -> Result<ProcessStatus, PluginError> {
+        let len = audio.frames_count() as usize;
 
-    unsafe extern "C" fn stop_processing(_plugin: *const clap_plugin) {}
-
-    unsafe extern "C" fn reset(plugin: *const clap_plugin) {
-        let instance = &*(plugin as *const Self);
-        let process_state = &mut *instance.process_state.get();
-
-        if let Some(processor) = &mut process_state.processor {
-            instance.sync_processor(processor);
-            processor.reset();
-        }
-    }
-
-    unsafe extern "C" fn process(
-        plugin: *const clap_plugin,
-        process: *const clap_process,
-    ) -> clap_process_status {
-        let instance = &*(plugin as *const Self);
-        let process_state = &mut *instance.process_state.get();
-
-        let Some(processor) = &mut process_state.processor else {
-            return CLAP_PROCESS_ERROR;
-        };
-
-        let process = &*process;
-
-        let len = process.frames_count as usize;
-
-        let input_count = process.audio_inputs_count as usize;
-        let output_count = process.audio_outputs_count as usize;
-        if input_count != instance.input_bus_map.len()
-            || output_count != instance.output_bus_map.len()
+        let input_count = audio.input_port_count();
+        let output_count = audio.output_port_count();
+        if input_count != self.instance.input_bus_map.len()
+            || output_count != self.instance.output_bus_map.len()
         {
-            return CLAP_PROCESS_ERROR;
+            return Err(PluginError::Message("Input/Output ports mismatch"));
         }
 
-        let inputs = slice_from_raw_parts_checked(process.audio_inputs, input_count);
-        let outputs = slice_from_raw_parts_checked(process.audio_outputs, output_count);
+        for (&bus_index, mut output) in zip(&self.instance.output_bus_map, audio.output_ports()) {
+            let data = &self.buffer_data[bus_index];
 
-        for (&bus_index, output) in zip(&instance.output_bus_map, outputs) {
-            let data = &process_state.buffer_data[bus_index];
-
-            let channel_count = output.channel_count as usize;
+            let channel_count = output.channel_count() as usize;
             if channel_count != data.end - data.start {
-                return CLAP_PROCESS_ERROR;
+                return Err(PluginError::Message("Channel count mismatch"));
             }
 
-            let channels =
-                slice_from_raw_parts_checked(output.data32 as *const *mut f32, channel_count);
-            process_state.buffer_ptrs[data.start..data.end].copy_from_slice(channels);
+            let channels = output.channels()?.into_f32().ok_or(PluginError::Message(
+                "Expected f32 (float) output audio channels",
+            ))?;
+
+            self.buffer_ptrs[data.start..data.end].copy_from_slice(channels.raw_data());
         }
 
-        for (&bus_index, input) in zip(&instance.input_bus_map, inputs) {
-            let data = &process_state.buffer_data[bus_index];
-            let bus_info = &instance.info.buses[bus_index];
+        for (&bus_index, input) in zip(&self.instance.input_bus_map, audio.input_ports()) {
+            let data = &self.buffer_data[bus_index];
+            let bus_info = &self.instance.info.buses[bus_index];
 
-            let channel_count = input.channel_count as usize;
+            let channel_count = input.channel_count() as usize;
             if channel_count != data.end - data.start {
-                return CLAP_PROCESS_ERROR;
+                return Err(PluginError::Message("Channel count mismatch"));
             }
 
-            let channels =
-                slice_from_raw_parts_checked(input.data32 as *const *mut f32, channel_count);
-            let ptrs = &mut process_state.buffer_ptrs[data.start..data.end];
+            let channels = input.channels()?.into_f32().ok_or(PluginError::Message(
+                "Expected f32 (float) input audio channels",
+            ))?;
+
+            let ptrs = &mut self.buffer_ptrs[data.start..data.end];
 
             match bus_info.dir {
                 BusDir::In => {
-                    ptrs.copy_from_slice(channels);
+                    ptrs.copy_from_slice(channels.raw_data());
                 }
-                BusDir::InOut => {
-                    for (&src, &mut dst) in zip(channels, ptrs) {
-                        if src != dst {
-                            let src = slice::from_raw_parts(src, len);
+                BusDir::InOut => unsafe {
+                    for (src, &mut dst) in zip(channels, ptrs) {
+                        if src.as_ptr() != dst {
                             let dst = slice::from_raw_parts_mut(dst, len);
                             dst.copy_from_slice(src);
                         }
                     }
-                }
+                },
                 BusDir::Out => unreachable!(),
             }
         }
 
-        process_state.events.clear();
+        self.events.clear();
 
-        let in_events = process.in_events;
-        let size = (*in_events).size.unwrap()(in_events);
-        for i in 0..size {
-            let event = (*in_events).get.unwrap()(in_events, i);
+        for event in events.input {
+            let Some(event) = event.as_core_event() else {
+                continue;
+            };
 
-            if (*event).space_id == CLAP_CORE_EVENT_SPACE_ID
-                && (*event).type_ == CLAP_EVENT_PARAM_VALUE
-            {
-                let event = &*(event as *const clap_event_param_value);
+            if let CoreEventSpace::ParamValue(event) = event {
+                if let Some(&index) = self.instance.param_map.get(&event.param_id()) {
+                    let value = map_param_in(&self.instance.info.params[index], event.value());
 
-                if let Some(&index) = instance.param_map.get(&event.param_id) {
-                    let value = map_param_in(&instance.info.params[index], event.value);
-
-                    process_state.events.push(Event {
-                        time: event.header.time as i64,
+                    self.events.push(Event {
+                        time: event.header().time() as i64,
                         data: Data::ParamChange {
-                            id: event.param_id,
+                            id: event.param_id(),
                             value,
                         },
                     });
 
-                    instance.plugin_params.set(index, value);
+                    self.instance.plugin_params.set(index, value);
                 }
             }
         }
 
-        instance.sync_processor(processor);
-        processor.process(
-            Buffers::from_raw_parts(
-                RawBuffers {
-                    buffers: &process_state.buffer_data,
-                    ptrs: &process_state.buffer_ptrs,
-                    offset: 0,
-                },
-                len,
-            ),
-            Events::new(&process_state.events),
+        self.instance.sync_processor(&mut self.processor);
+
+        self.processor.process(
+            unsafe {
+                Buffers::from_raw_parts(
+                    RawBuffers {
+                        buffers: &self.buffer_data,
+                        ptrs: &self.buffer_ptrs,
+                        offset: 0,
+                    },
+                    len,
+                )
+            },
+            Events::new(&self.events),
         );
 
-        CLAP_PROCESS_CONTINUE
+        Ok(ProcessStatus::Continue)
     }
-
-    unsafe extern "C" fn get_extension(
-        plugin: *const clap_plugin,
-        id: *const c_char,
-    ) -> *const c_void {
-        let id = CStr::from_ptr(id);
-
-        if id == CLAP_EXT_AUDIO_PORTS {
-            return &Self::AUDIO_PORTS as *const _ as *const c_void;
-        }
-
-        if id == CLAP_EXT_AUDIO_PORTS_CONFIG {
-            return &Self::AUDIO_PORTS_CONFIG as *const _ as *const c_void;
-        }
-
-        if id == CLAP_EXT_PARAMS {
-            return &Self::PARAMS as *const _ as *const c_void;
-        }
-
-        if id == CLAP_EXT_STATE {
-            return &Self::STATE as *const _ as *const c_void;
-        }
-
-        if id == CLAP_EXT_GUI {
-            let instance = &*(plugin as *const Self);
-            if instance.info.has_editor {
-                return &Self::GUI as *const _ as *const c_void;
-            }
-        }
-
-        ptr::null()
-    }
-
-    unsafe extern "C" fn on_main_thread(_plugin: *const clap_plugin) {}
 }
 
-impl<P: Plugin> Instance<P> {
-    const AUDIO_PORTS: clap_plugin_audio_ports = clap_plugin_audio_ports {
-        count: Some(Self::audio_ports_count),
-        get: Some(Self::audio_ports_get),
-    };
-
-    unsafe extern "C" fn audio_ports_count(plugin: *const clap_plugin, is_input: bool) -> u32 {
-        let instance = &*(plugin as *const Self);
-
+impl<'a, P: Plugin> PluginAudioPortsImpl for MainThreadState<'a, P> {
+    fn count(&mut self, is_input: bool) -> u32 {
         if is_input {
-            instance.input_bus_map.len() as u32
+            self.instance.input_bus_map.len() as u32
         } else {
-            instance.output_bus_map.len() as u32
+            self.instance.output_bus_map.len() as u32
         }
     }
 
-    unsafe extern "C" fn audio_ports_get(
-        plugin: *const clap_plugin,
-        index: u32,
-        is_input: bool,
-        info: *mut clap_audio_port_info,
-    ) -> bool {
-        let instance = &*(plugin as *const Self);
-        let main_thread_state = &mut *instance.main_thread_state.get();
-
+    fn get(&mut self, is_input: bool, index: u32, writer: &mut AudioPortInfoWriter) {
         let bus_index = if is_input {
-            instance.input_bus_map.get(index as usize)
+            self.instance.input_bus_map.get(index as usize)
         } else {
-            instance.output_bus_map.get(index as usize)
+            self.instance.output_bus_map.get(index as usize)
         };
 
         if let Some(&bus_index) = bus_index {
-            let bus_info = instance.info.buses.get(bus_index);
+            let bus_info = self.instance.info.buses.get(bus_index);
 
-            let layout = &instance.info.layouts[main_thread_state.layout_index];
+            let layout = &self.instance.info.layouts[self.layout_index];
             let format = layout.formats.get(bus_index);
 
             if let (Some(bus_info), Some(format)) = (bus_info, format) {
-                let port_info = &mut *info;
-
-                port_info.id = index;
-                copy_cstring(&bus_info.name, &mut port_info.name);
-                port_info.flags = if index == 0 {
-                    CLAP_AUDIO_PORT_IS_MAIN
-                } else {
-                    0
-                };
-                port_info.channel_count = format.channel_count() as u32;
-                port_info.port_type = port_type_from_format(format).as_ptr();
-                port_info.in_place_pair = if bus_info.dir == BusDir::InOut {
-                    // Find the other half of this input-output pair
-                    let bus_map = if is_input {
-                        &instance.output_bus_map
+                writer.set(&AudioPortInfoData {
+                    id: index,
+                    name: bus_info.name.as_bytes(),
+                    channel_count: 0,
+                    flags: if index == 0 {
+                        AudioPortFlags::IS_MAIN
                     } else {
-                        &instance.input_bus_map
-                    };
+                        AudioPortFlags::empty()
+                    },
+                    port_type: Some(port_type_from_format(format)),
+                    in_place_pair: if bus_info.dir == BusDir::InOut {
+                        // Find the other half of this input-output pair
+                        let bus_map = if is_input {
+                            &self.instance.output_bus_map
+                        } else {
+                            &self.instance.input_bus_map
+                        };
 
-                    bus_map.iter().position(|&i| i == bus_index).unwrap() as clap_id
-                } else {
-                    CLAP_INVALID_ID
-                };
-
-                return true;
+                        bus_map.iter().position(|&i| i == bus_index).map(|i| i as u32)
+                    } else {
+                        None
+                    },
+                });
             }
         }
-
-        false
     }
 }
 
-impl<P: Plugin> Instance<P> {
-    const AUDIO_PORTS_CONFIG: clap_plugin_audio_ports_config = clap_plugin_audio_ports_config {
-        count: Some(Self::audio_ports_config_count),
-        get: Some(Self::audio_ports_config_get),
-        select: Some(Self::audio_ports_config_select),
-    };
-
-    unsafe extern "C" fn audio_ports_config_count(plugin: *const clap_plugin) -> u32 {
-        let instance = &*(plugin as *const Self);
-
-        instance.info.layouts.len() as u32
+impl<'a, P: Plugin> PluginAudioPortsConfigImpl for MainThreadState<'a, P> {
+    fn count(&mut self) -> u32 {
+        self.instance.info.layouts.len() as u32
     }
 
-    unsafe extern "C" fn audio_ports_config_get(
-        plugin: *const clap_plugin,
-        index: u32,
-        config: *mut clap_audio_ports_config,
-    ) -> bool {
-        let instance = &*(plugin as *const Self);
+    fn get(&mut self, index: u32, writer: &mut AudioPortConfigWriter) {
+        let instance = self.instance;
 
         if let Some(layout) = instance.info.layouts.get(index as usize) {
-            let config = &mut *config;
+            writer.write(&AudioPortsConfiguration {
+                id: index,
+                name: b"",
+                input_port_count: instance.input_bus_map.len() as u32,
+                output_port_count: instance.output_bus_map.len() as u32,
+                main_input: if let Some(&bus_index) = instance.input_bus_map.first() {
+                    let format = &layout.formats[bus_index];
 
-            config.id = index;
-            copy_cstring("", &mut config.name);
-            config.input_port_count = instance.input_bus_map.len() as u32;
-            config.output_port_count = instance.output_bus_map.len() as u32;
+                    Some(MainPortInfo {
+                        channel_count: format.channel_count() as u32,
+                        port_type: Some(port_type_from_format(format)),
+                    })
+                } else {
+                    None
+                },
+                main_output: if let Some(&bus_index) = instance.output_bus_map.first() {
+                    let format = &layout.formats[bus_index];
 
-            if let Some(&bus_index) = instance.input_bus_map.first() {
-                config.has_main_input = true;
-
-                let format = &layout.formats[bus_index];
-                config.main_input_channel_count = format.channel_count() as u32;
-                config.main_input_port_type = port_type_from_format(format).as_ptr();
-            } else {
-                config.has_main_input = false;
-                config.main_input_channel_count = 0;
-                config.main_input_port_type = ptr::null();
-            }
-
-            if let Some(&bus_index) = instance.output_bus_map.first() {
-                config.has_main_output = true;
-
-                let format = &layout.formats[bus_index];
-                config.main_output_channel_count = format.channel_count() as u32;
-                config.main_output_port_type = port_type_from_format(format).as_ptr();
-            } else {
-                config.has_main_output = false;
-                config.main_output_channel_count = 0;
-                config.main_output_port_type = ptr::null();
-            }
-
-            return true;
+                    Some(MainPortInfo {
+                        channel_count: format.channel_count() as u32,
+                        port_type: Some(port_type_from_format(format)),
+                    })
+                } else {
+                    None
+                },
+            })
         }
-
-        false
     }
 
-    unsafe extern "C" fn audio_ports_config_select(
-        plugin: *const clap_plugin,
-        config_id: clap_id,
-    ) -> bool {
-        let instance = &*(plugin as *const Self);
-        let main_thread_state = &mut *instance.main_thread_state.get();
-
-        if instance.info.layouts.get(config_id as usize).is_some() {
-            main_thread_state.layout_index = config_id as usize;
-            return true;
+    fn select(&mut self, config_id: u32) -> Result<(), AudioPortConfigSelectError> {
+        if self.instance.info.layouts.get(config_id as usize).is_some() {
+            self.layout_index = config_id as usize;
+            Ok(())
+        } else {
+            Err(AudioPortConfigSelectError)
         }
-
-        false
     }
 }
 
-impl<P: Plugin> Instance<P> {
-    const PARAMS: clap_plugin_params = clap_plugin_params {
-        count: Some(Self::params_count),
-        get_info: Some(Self::params_get_info),
-        get_value: Some(Self::params_get_value),
-        value_to_text: Some(Self::params_value_to_text),
-        text_to_value: Some(Self::params_text_to_value),
-        flush: Some(Self::params_flush),
-    };
-
-    unsafe extern "C" fn params_count(plugin: *const clap_plugin) -> u32 {
-        let instance = &*(plugin as *const Self);
-
-        instance.info.params.len() as u32
+impl<'a, P: Plugin> PluginMainThreadParams for MainThreadState<'a, P> {
+    fn count(&mut self) -> u32 {
+        self.instance.info.params.len() as u32
     }
 
-    unsafe extern "C" fn params_get_info(
-        plugin: *const clap_plugin,
-        param_index: u32,
-        param_info: *mut clap_param_info,
-    ) -> bool {
-        let instance = &*(plugin as *const Self);
+    fn get_info(&mut self, param_index: u32, writer: &mut ParamInfoWriter) {
+        if let Some(param) = self.instance.info.params.get(param_index as usize) {
+            let mut info = ParamInfoData {
+                id: param.id,
+                flags: ParamInfoFlags::IS_AUTOMATABLE,
+                cookie: Cookie::empty(),
+                name: &param.name,
+                module: "",
+                min_value: 0.0,
+                max_value: 1.0,
+                default_value: map_param_out(&param, param.default),
+            };
 
-        if let Some(param) = instance.info.params.get(param_index as usize) {
-            let param_info = &mut *param_info;
-
-            param_info.id = param.id;
-            param_info.flags = CLAP_PARAM_IS_AUTOMATABLE;
-            param_info.cookie = ptr::null_mut();
-            copy_cstring(&param.name, &mut param_info.name);
-            copy_cstring("", &mut param_info.module);
             if let Some(steps) = param.steps {
-                param_info.flags |= CLAP_PARAM_IS_STEPPED;
-                param_info.min_value = 0.0;
-                param_info.max_value = (steps.max(2) - 1) as f64;
-            } else {
-                param_info.min_value = 0.0;
-                param_info.max_value = 1.0;
+                info.flags |= ParamInfoFlags::IS_STEPPED;
+                info.min_value = 0.0;
+                info.max_value = (steps.max(2) - 1) as f64;
             }
-            param_info.default_value = map_param_out(&param, param.default);
 
-            return true;
+            writer.set(&info);
         }
-
-        false
     }
 
-    unsafe extern "C" fn params_get_value(
-        plugin: *const clap_plugin,
-        param_id: clap_id,
-        value: *mut f64,
-    ) -> bool {
-        let instance = &*(plugin as *const Self);
-        let main_thread_state = &mut *instance.main_thread_state.get();
+    fn get_value(&mut self, param_id: u32) -> Option<f64> {
+        let &index = self.instance.param_map.get(&param_id)?;
+        self.instance.sync_plugin(&mut self.plugin);
 
-        if let Some(&index) = instance.param_map.get(&param_id) {
-            instance.sync_plugin(&mut main_thread_state.plugin);
-
-            let param = &instance.info.params[index];
-            *value = map_param_out(param, main_thread_state.plugin.get_param(param_id));
-            return true;
-        }
-
-        false
+        let param = &self.instance.info.params[index];
+        Some(map_param_out(param, self.plugin.get_param(param_id)))
     }
 
-    unsafe extern "C" fn params_value_to_text(
-        plugin: *const clap_plugin,
-        param_id: clap_id,
+    fn value_to_text(
+        &mut self,
+        param_id: u32,
         value: f64,
-        display: *mut c_char,
-        size: u32,
-    ) -> bool {
-        let instance = &*(plugin as *const Self);
+        writer: &mut ParamDisplayWriter,
+    ) -> std::fmt::Result {
+        use std::fmt::Write;
 
-        if let Some(&index) = instance.param_map.get(&param_id) {
-            let param = &instance.info.params[index];
+        let &index = self.instance.param_map.get(&param_id).ok_or(std::fmt::Error)?;
+        let param = &self.instance.info.params[index];
 
-            let text = format!("{}", DisplayParam(param, map_param_in(param, value)));
-
-            let dst = slice::from_raw_parts_mut(display, size as usize);
-            copy_cstring(&text, dst);
-
-            return true;
-        }
-
-        false
+        write!(
+            writer,
+            "{}",
+            DisplayParam(param, map_param_in(param, value))
+        )
     }
 
-    unsafe extern "C" fn params_text_to_value(
-        plugin: *const clap_plugin,
-        param_id: clap_id,
-        display: *const c_char,
-        value: *mut f64,
-    ) -> bool {
-        let instance = &*(plugin as *const Self);
+    fn text_to_value(&mut self, param_id: u32, text: &str) -> Option<f64> {
+        let &index = self.instance.param_map.get(&param_id)?;
+        let param = &self.instance.info.params[index];
 
-        if let Some(&index) = instance.param_map.get(&param_id) {
-            if let Ok(text) = CStr::from_ptr(display).to_str() {
-                let param = &instance.info.params[index];
-                if let Some(out) = (param.parse)(text) {
-                    *value = map_param_out(param, out);
-                    return true;
-                }
-            }
-
-            return true;
-        }
-
-        false
+        (param.parse)(text)
     }
 
-    unsafe extern "C" fn params_flush(
-        plugin: *const clap_plugin,
-        in_: *const clap_input_events,
-        _out: *const clap_output_events,
+    fn flush(
+        &mut self,
+        input_parameter_changes: &InputEvents,
+        _output_parameter_changes: &mut OutputEvents,
     ) {
-        let instance = &*(plugin as *const Self);
-        let process_state = &mut *instance.process_state.get();
+        self.instance.sync_plugin(&mut self.plugin);
 
-        // If we are in the active state, flush will be called on the audio thread.
-        if let Some(processor) = &mut process_state.processor {
-            instance.sync_processor(processor);
+        for event in input_parameter_changes {
+            let Some(event) = event.as_core_event() else {
+                continue;
+            };
 
-            let size = (*in_).size.unwrap()(in_);
-            for i in 0..size {
-                let event = (*in_).get.unwrap()(in_, i);
-
-                if (*event).space_id == CLAP_CORE_EVENT_SPACE_ID
-                    && (*event).type_ == CLAP_EVENT_PARAM_VALUE
-                {
-                    let event = &*(event as *const clap_event_param_value);
-
-                    if let Some(&index) = instance.param_map.get(&event.param_id) {
-                        let value = map_param_in(&instance.info.params[index], event.value);
-                        processor.set_param(event.param_id, value);
-                        instance.plugin_params.set(index, value);
-                    }
-                }
-            }
-        }
-        // Otherwise, flush will be called on the main thread.
-        else {
-            let main_thread_state = &mut *instance.main_thread_state.get();
-
-            instance.sync_plugin(&mut main_thread_state.plugin);
-
-            let size = (*in_).size.unwrap()(in_);
-            for i in 0..size {
-                let event = (*in_).get.unwrap()(in_, i);
-
-                if (*event).space_id == CLAP_CORE_EVENT_SPACE_ID
-                    && (*event).type_ == CLAP_EVENT_PARAM_VALUE
-                {
-                    let event = &*(event as *const clap_event_param_value);
-
-                    if let Some(&index) = instance.param_map.get(&event.param_id) {
-                        let value = map_param_in(&instance.info.params[index], event.value);
-                        main_thread_state.plugin.set_param(event.param_id, value);
-                        instance.processor_params.set(index, value);
-                    }
+            if let CoreEventSpace::ParamValue(event) = event {
+                if let Some(&index) = self.instance.param_map.get(&event.param_id()) {
+                    let value = map_param_in(&self.instance.info.params[index], event.value());
+                    self.plugin.set_param(event.param_id(), value);
+                    self.instance.processor_params.set(index, value);
                 }
             }
         }
     }
 }
 
-impl<P: Plugin> Instance<P> {
-    const STATE: clap_plugin_state = clap_plugin_state {
-        save: Some(Self::state_save),
-        load: Some(Self::state_load),
-    };
+impl<'a, P: Plugin> PluginAudioProcessorParams for ProcessState<'a, P> {
+    fn flush(
+        &mut self,
+        input_parameter_changes: &InputEvents,
+        _output_parameter_changes: &mut OutputEvents,
+    ) {
+        self.instance.sync_processor(&mut self.processor);
 
-    unsafe extern "C" fn state_save(
-        plugin: *const clap_plugin,
-        stream: *const clap_ostream,
-    ) -> bool {
-        struct StreamWriter(*const clap_ostream);
+        for event in input_parameter_changes {
+            let Some(event) = event.as_core_event() else {
+                continue;
+            };
 
-        impl io::Write for StreamWriter {
-            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-                let result = unsafe {
-                    (*self.0).write.unwrap()(
-                        self.0,
-                        buf.as_ptr() as *const c_void,
-                        buf.len() as u64,
-                    )
-                };
-
-                if result == -1 {
-                    Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        "failed to write to stream",
-                    ))
-                } else {
-                    io::Result::Ok(result as usize)
+            if let CoreEventSpace::ParamValue(event) = event {
+                if let Some(&index) = self.instance.param_map.get(&event.param_id()) {
+                    let value = map_param_in(&self.instance.info.params[index], event.value());
+                    self.processor.set_param(event.param_id(), value);
+                    self.instance.plugin_params.set(index, value);
                 }
             }
-
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
         }
+    }
+}
 
-        let instance = &*(plugin as *const Self);
-        let main_thread_state = &mut *instance.main_thread_state.get();
+impl<'a, P: Plugin> PluginStateImpl for MainThreadState<'a, P> {
+    fn save(&mut self, output: &mut OutputStream) -> Result<(), PluginError> {
+        self.instance.sync_plugin(&mut self.plugin);
+        self.plugin.save(output)?;
 
-        instance.sync_plugin(&mut main_thread_state.plugin);
-        let result = main_thread_state.plugin.save(&mut StreamWriter(stream));
-        result.is_ok()
+        Ok(())
     }
 
-    unsafe extern "C" fn state_load(
-        plugin: *const clap_plugin,
-        stream: *const clap_istream,
-    ) -> bool {
-        struct StreamReader(*const clap_istream);
+    fn load(&mut self, input: &mut InputStream) -> Result<(), PluginError> {
+        self.instance.sync_plugin(&mut self.plugin);
+        self.plugin.load(input)?;
 
-        impl io::Read for StreamReader {
-            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-                let result = unsafe {
-                    (*self.0).read.unwrap()(
-                        self.0,
-                        buf.as_mut_ptr() as *mut c_void,
-                        buf.len() as u64,
-                    )
-                };
-
-                if result == -1 {
-                    Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        "failed to read from stream",
-                    ))
-                } else {
-                    io::Result::Ok(result as usize)
-                }
-            }
+        for (index, param) in self.instance.info.params.iter().enumerate() {
+            let value = self.plugin.get_param(param.id);
+            self.instance.processor_params.set(index, value);
         }
 
-        let instance = &*(plugin as *const Self);
-        let main_thread_state = &mut *instance.main_thread_state.get();
-
-        instance.sync_plugin(&mut main_thread_state.plugin);
-        if let Ok(_) = main_thread_state.plugin.load(&mut StreamReader(stream)) {
-            for (index, param) in instance.info.params.iter().enumerate() {
-                let value = main_thread_state.plugin.get_param(param.id);
-                instance.processor_params.set(index, value);
-            }
-
-            return true;
-        }
-
-        false
+        Ok(())
     }
 }

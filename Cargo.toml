@@ -8,8 +8,9 @@ publish = false
 
 [dependencies]
 coupler-derive = { path = "coupler-derive", optional = true }
-clap-sys = "0.3.0"
-vst3 = "0.1.1"
+clack-plugin = { workspace = true }
+clack-extensions = { workspace = true, features = ["audio-ports", "note-ports", "audio-ports-config", "params", "state", "gui", "clack-plugin"] }
+# vst3 = "0.1.1"
 
 [features]
 derive = ["coupler-derive"]
@@ -24,3 +25,5 @@ members = [
 
 [workspace.dependencies]
 coupler = { path = "." }
+clack-plugin = { git = "https://github.com/prokopyl/clack", rev = '03489c68ad14e8cc7fe3bdba6b9e847ffb77ceeb' }
+clack-extensions = { git = "https://github.com/prokopyl/clack", rev = '03489c68ad14e8cc7fe3bdba6b9e847ffb77ceeb' }
